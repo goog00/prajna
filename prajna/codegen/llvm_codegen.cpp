@@ -1,5 +1,8 @@
 #include "prajna/codegen/llvm_codegen.h"
 
+#include <llvm/Support/Casting.h>
+
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constant.h"
@@ -27,6 +30,8 @@
 #include "llvm/Linker/Linker.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/raw_ostream.h"
 #include "prajna/global_config.hpp"
 #include "prajna/helper.hpp"
 #include "prajna/ir/ir.hpp"
@@ -36,7 +41,6 @@
 #include "third_party/llvm-project/llvm/include/llvm-c/Target.h"
 #include "third_party/llvm-project/llvm/include/llvm/Analysis/AliasAnalysis.h"
 #include "third_party/llvm-project/llvm/include/llvm/IR/AutoUpgrade.h"
-
 namespace llvm {
 class Module;
 class LLVMContext;
@@ -423,6 +427,70 @@ class LlvmCodegen : public prajna::ir::Visitor {
 
     void Visit(std::shared_ptr<ir::Call> ir_call) override {
         auto llvm_basic_block = GetLlvmBasicBlock(ir_call);
+
+        // 只特判内建占位：::__lowering_builtin_memcpy
+        if (ir_call->Function()->fullname == "::__lowering_builtin_memcpy") {
+            llvm::Value *dst_value = ir_call->Arguments()[0]->llvm_value;
+            llvm::Value *src_value = ir_call->Arguments()[1]->llvm_value;
+            llvm::Value *size_value = ir_call->Arguments()[2]->llvm_value;
+
+            llvm::Module *module = llvm_basic_block->getModule();
+            const llvm::DataLayout &data_layout = module->getDataLayout();
+
+            // 保守对齐：只有当“基地址对齐”能整除“常量偏移”时才采用该对齐，否则降级为 Align(1)
+            auto compute_safe_align = [&](llvm::Value *ptr) -> llvm::Align {
+                if (!ptr) return llvm::Align(1);
+
+                int64_t offset_bytes = 0;
+                llvm::Value *base =
+                    llvm::GetPointerBaseWithConstantOffset(ptr, offset_bytes, data_layout);
+
+                llvm::Align base_align(1);
+                if (auto *alloca_inst = llvm::dyn_cast<llvm::AllocaInst>(base)) {
+                    if (auto *ty = alloca_inst->getAllocatedType()) {
+                        base_align = data_layout.getABITypeAlign(ty);  // ABI 对齐
+                    }
+                } else if (auto *global_var = llvm::dyn_cast<llvm::GlobalVariable>(base)) {
+                    base_align = data_layout.getPreferredAlign(global_var);  // preferred 对齐
+                } else {
+                    base_align = llvm::Align(1);
+                }
+
+                uint64_t abs_off = (offset_bytes >= 0) ? static_cast<uint64_t>(offset_bytes)
+                                                       : static_cast<uint64_t>(-offset_bytes);
+
+                // 偏移不是基对齐的整数倍 → 降为 1，避免优化时高估对齐
+                if (base_align.value() == 0 || (abs_off % base_align.value()) != 0) {
+                    return llvm::Align(1);
+                }
+
+                return base_align;
+            };
+
+            llvm::Align dst_align = compute_safe_align(dst_value);
+            llvm::Align src_align = compute_safe_align(src_value);
+
+            // 大块拷贝 → volatile，避免 O1/O2 把 memcpy 打散（阈值可调）
+            bool is_huge = false;
+            if (auto *c_size = llvm::dyn_cast<llvm::ConstantInt>(size_value)) {
+                constexpr uint64_t k_huge_bytes = (1ull << 5);
+                is_huge = c_size->getZExtValue() >= k_huge_bytes;
+            }
+
+            llvm::IRBuilder<> ir_builder(llvm_basic_block);
+            if (auto *term = llvm_basic_block->getTerminator()) {
+                ir_builder.SetInsertPoint(term);
+            } else {
+                ir_builder.SetInsertPoint(llvm_basic_block);
+            }
+
+            llvm::CallInst *memcpy_inst = ir_builder.CreateMemCpy(
+                dst_value, dst_align, src_value, src_align, size_value, /*isVolatile=*/is_huge);
+
+            ir_call->llvm_value = memcpy_inst;
+            return;
+        }
+
         auto ir_function_type = ir_call->Function()->GetFunctionType();
         auto llvm_arguments = To<std::vector<llvm::Value *>>(
             (ir_call->Arguments() | std::ranges::views::transform([this](auto ir_argument) {
@@ -866,7 +934,29 @@ void GenerateLlvmPass(std::shared_ptr<ir::Module> ir_module) {
     MPM.run(*ir_module->llvm_module, MAM);
 
     if (GlobalConfig::Instance().get<bool>("prajna.dump_llvm_ir", false)) {
-        ir_module->llvm_module->dump();
+        auto module_name = ir_module->name;
+        // 跳过内建包与占位未定义名字的模块
+        bool skip = (module_name.find("builtin") != std::string::npos) ||
+                    (module_name.find("NameIsUndefined") != std::string::npos);
+
+        if (!skip) {
+            std::error_code EC;
+            auto ts = std::chrono::system_clock::now().time_since_epoch().count();
+
+            for (auto &ch : module_name) {
+                if (ch == '/' || ch == '\\' || ch == ' ') {
+                    ch = '_';  // 替换为下划线
+                }
+            }
+            std::string filename = "/tmp/prajna" + module_name + "_" + std::to_string(ts) + ".ll";
+
+            llvm::raw_fd_ostream out(filename, EC, llvm::sys::fs::OF_Text);
+            if (EC) {
+                llvm::errs() << "Error opening file " << filename << ": " << EC.message() << "\n";
+            } else {
+                ir_module->llvm_module->print(out, nullptr);
+            }
+        }
     }
 
     // no errors, return false

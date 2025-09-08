@@ -237,67 +237,198 @@ class ExpressionLoweringVisitor {
 
     std::shared_ptr<ir::Value> ApplyBinaryOperationCall(std::shared_ptr<ir::Value> ir_lhs,
                                                         ast::BinaryOperation ast_binary_operation) {
-        auto ir_arguments = *Cast<ir::ValueCollection>(applyOperand(ast_binary_operation.operand));
+        auto ir_user_arguments =
+            *Cast<ir::ValueCollection>(applyOperand(ast_binary_operation.operand));
         PRAJNA_ASSERT(ast_binary_operation.operand.type() == typeid(ast::Expressions));
         auto ast_expressions = boost::get<ast::Expressions>(ast_binary_operation.operand);
+        // 成员函数调用
         if (auto ir_member_function_with_this_pointer =
                 Cast<ir::MemberFunctionWithThisPointer>(ir_lhs)) {
             auto ir_function_type =
                 ir_member_function_with_this_pointer->function_prototype->function_type;
-            if (ir_arguments.size() + 1 != ir_function_type->parameter_types.size()) {
-                logger->Error(
-                    fmt::format(
-                        "the arguments size is not matched, require {} argument, but give {}",
-                        ir_function_type->parameter_types.size() - 1, ir_arguments.size()),
-                    ast_expressions);
+
+            // 判定是否为 sret：返回 void 且第 0 个形参是 Pointer(Array<...>)
+            bool is_struct_return_function = false;
+            std::shared_ptr<ir::PointerType> struct_return_pointer_type = nullptr;
+            if (Is<ir::VoidType>(ir_function_type->return_type)) {
+                if (!ir_function_type->parameter_types.empty()) {
+                    auto first_parameter_type = *ir_function_type->parameter_types.begin();
+                    if (auto pointer_type = Cast<ir::PointerType>(first_parameter_type)) {
+                        if (Cast<ir::ArrayType>(pointer_type->value_type)) {
+                            is_struct_return_function = true;
+                            struct_return_pointer_type = pointer_type;
+                        }
+                    }
+                }
             }
-            for (auto [ir_argument, ir_parameter_type, ast_expression] :
-                 boost::combine(ir_arguments,
-                                boost::make_iterator_range(
-                                    std::next(ir_function_type->parameter_types.begin()),
-                                    ir_function_type->parameter_types.end()),
-                                ast_expressions)) {
-                if (ir_argument->type != ir_parameter_type) {
-                    logger->Error("the argument type is not matched", ast_expression);
+            //  形参个数检查（考虑 sret 和 this-pointer）
+            {
+                std::size_t expected_user_argument_count = ir_function_type->parameter_types.size();
+                if (is_struct_return_function) {
+                    expected_user_argument_count -= 1;  // [SRET] sret 由我们补，不由用户提供
+                }
+                expected_user_argument_count -= 1;  // this-pointer
+                if (ir_user_arguments.size() != expected_user_argument_count) {
+                    logger->Error(
+                        fmt::format(
+                            "the arguments size is not matched, require {} argument, but give {}",
+                            expected_user_argument_count, ir_user_arguments.size()),
+                        ast_expressions);
                 }
             }
 
-            ir_arguments.insert(ir_arguments.begin(),
-                                ir_member_function_with_this_pointer->this_pointer);
-            return ir_builder->Call(ir_member_function_with_this_pointer->function_prototype,
-                                    ir_arguments);
+            // 对指针形参且用户给了按值数组的情况，自动取址
+            // 跳过 sret 与 this-pointer 两个形参位
+            {
+                auto iter_parameter_type = ir_function_type->parameter_types.begin();
+                if (is_struct_return_function) {
+                    ++iter_parameter_type;  // 跳过 sret
+                }
+                ++iter_parameter_type;  // 跳过 this-pointer
+
+                for (auto &ir_argument_value : ir_user_arguments) {
+                    if (iter_parameter_type == ir_function_type->parameter_types.end()) {
+                        logger->Error("too many arguments", ast_expressions);
+                    }
+
+                    auto current_parameter_type = *iter_parameter_type;
+                    if (auto pointer_parameter_type =
+                            Cast<ir::PointerType>(current_parameter_type)) {
+                        if (pointer_parameter_type->value_type == ir_argument_value->type) {
+                            auto ir_variable_liked =
+                                ir_builder->VariableLikedNormalize(ir_argument_value);
+                            ir_argument_value = ir_builder->Create<ir::GetAddressOfVariableLiked>(
+                                ir_variable_liked);
+                        }
+                    }
+
+                    ++iter_parameter_type;
+                }
+            }
+            // 组装最终实参顺序：sret > this-pointer > 用户实参
+            std::list<std::shared_ptr<ir::Value>> ir_final_arguments;
+
+            // 为 sret 结果分配临时并把地址放到最前
+            std::shared_ptr<ir::LocalVariable> ir_result_temporary = nullptr;
+            if (is_struct_return_function) {
+                PRAJNA_ASSERT(struct_return_pointer_type);
+                auto ir_result_type = struct_return_pointer_type->value_type;
+                ir_result_temporary = ir_builder->Create<ir::LocalVariable>(ir_result_type);
+                auto ir_result_address =
+                    ir_builder->Create<ir::GetAddressOfVariableLiked>(ir_result_temporary);
+                ir_final_arguments.push_back(ir_result_address);
+            }
+
+            // 显式插入 this-pointer
+            ir_final_arguments.push_back(ir_member_function_with_this_pointer->this_pointer);
+            ir_user_arguments.insert(ir_user_arguments.begin(),
+                                     ir_member_function_with_this_pointer->this_pointer);
+            auto ir_call = ir_builder->Call(
+                ir_member_function_with_this_pointer->function_prototype, ir_user_arguments);
+            // [NEW][SRET] sret 返回临时值；否则返回调用值
+            if (is_struct_return_function) {
+                return ir_result_temporary;
+            } else {
+                return ir_call;
+            }
         }
 
+        // 直接函数调用分支】
         if (ir_lhs->IsFunction()) {
             auto ir_function_type = ir_lhs->GetFunctionType();
-            if (ir_arguments.size() != ir_function_type->parameter_types.size()) {
-                logger->Error(
-                    fmt::format(
-                        "the arguments size is not matched, require {} argument, but give {}",
-                        ir_function_type->parameter_types.size(), ir_arguments.size()),
-                    ast_expressions);
-            }
-            for (auto [ir_argument, ir_parameter_type, ast_experssion] :
-                 boost::combine(ir_arguments, ir_function_type->parameter_types, ast_expressions)) {
-                if (ir_argument->type != ir_parameter_type) {
-                    logger->Error("the argument type is not matched", ast_expressions);
+            // 判定是否为 sret：返回 void 且第 0 个形参是 Pointer(Array<...>)
+            bool is_struct_return_function = false;
+            std::shared_ptr<ir::PointerType> struct_return_pointer_type = nullptr;
+            if (Is<ir::VoidType>(ir_function_type->return_type)) {
+                if (!ir_function_type->parameter_types.empty()) {
+                    auto first_parameter_type = *ir_function_type->parameter_types.begin();
+                    if (auto pointer_type = Cast<ir::PointerType>(first_parameter_type)) {
+                        if (Cast<ir::ArrayType>(pointer_type->value_type)) {
+                            is_struct_return_function = true;
+                            struct_return_pointer_type = pointer_type;
+                        }
+                    }
                 }
             }
 
-            return ir_builder->Call(ir_lhs, ir_arguments);
+            // 形参个数检查（考虑 sret）
+            {
+                std::size_t expected_user_argument_count = ir_function_type->parameter_types.size();
+                if (is_struct_return_function) {
+                    expected_user_argument_count -= 1;  // [SRET] sret 由我们补，不由用户提供
+                }
+                if (ir_user_arguments.size() != expected_user_argument_count) {
+                    logger->Error(
+                        fmt::format(
+                            "the arguments size is not matched, require {} argument, but give {}",
+                            expected_user_argument_count, ir_user_arguments.size()),
+                        ast_expressions);
+                }
+            }
+
+            //  对指针形参且用户给了按值数组的情况，自动取址（跳过 sret 形参位）
+            {
+                auto iter_parameter_type = ir_function_type->parameter_types.begin();
+                if (is_struct_return_function) {
+                    ++iter_parameter_type;  // 跳过 sret
+                }
+
+                for (auto &ir_argument_value : ir_user_arguments) {
+                    if (iter_parameter_type == ir_function_type->parameter_types.end()) {
+                        logger->Error("too many arguments", ast_expressions);
+                    }
+
+                    auto current_parameter_type = *iter_parameter_type;
+                    if (auto pointer_parameter_type =
+                            Cast<ir::PointerType>(current_parameter_type)) {
+                        if (pointer_parameter_type->value_type == ir_argument_value->type) {
+                            auto ir_variable_liked =
+                                ir_builder->VariableLikedNormalize(ir_argument_value);
+                            ir_argument_value = ir_builder->Create<ir::GetAddressOfVariableLiked>(
+                                ir_variable_liked);
+                        }
+                    }
+
+                    ++iter_parameter_type;
+                }
+            }
+
+            // [NEW] 组装最终实参顺序：sret（可选）→ 用户实参
+            std::list<std::shared_ptr<ir::Value>> ir_final_arguments = ir_user_arguments;
+
+            // [NEW][SRET] 为 sret 结果分配临时并把地址 push 到最前
+            std::shared_ptr<std::shared_ptr<ir::LocalVariable>>
+                dummy;  // 仅为说明：下一行是真正逻辑
+            std::shared_ptr<ir::LocalVariable> ir_result_temporary = nullptr;
+
+            if (is_struct_return_function) {
+                PRAJNA_ASSERT(struct_return_pointer_type);
+                auto ir_result_type = struct_return_pointer_type->value_type;
+                ir_result_temporary = ir_builder->Create<ir::LocalVariable>(ir_result_type);
+                auto ir_result_address =
+                    ir_builder->Create<ir::GetAddressOfVariableLiked>(ir_result_temporary);
+                ir_final_arguments.push_front(ir_result_address);
+            }
+
+            auto ir_call = ir_builder->Call(ir_lhs, ir_user_arguments);
+            if (is_struct_return_function) {
+                return ir_result_temporary;
+            } else {
+                return ir_call;
+            }
         }
 
         if (auto ir_member_function = ir_builder->GetMemberFunction(ir_lhs->type, "__call__")) {
             auto ir_function_type = ir_member_function->function_type;
-            if (ir_arguments.size() + 1 != ir_function_type->parameter_types.size()) {
+            if (ir_user_arguments.size() + 1 != ir_function_type->parameter_types.size()) {
                 logger->Error(
                     fmt::format(
                         "the arguments size is not matched, require {} argument, but give {}",
-                        ir_function_type->parameter_types.size() - 1, ir_arguments.size()),
+                        ir_function_type->parameter_types.size() - 1, ir_user_arguments.size()),
                     ast_expressions);
             }
             for (auto [ir_argument, ir_parameter_type, ast_expression] :
-                 boost::combine(ir_arguments,
+                 boost::combine(ir_user_arguments,
                                 boost::make_iterator_range(
                                     std::next(ir_function_type->parameter_types.begin()),
                                     ir_function_type->parameter_types.end()),
@@ -307,25 +438,25 @@ class ExpressionLoweringVisitor {
                 }
             }
 
-            ir_arguments.insert(ir_arguments.begin(), ir_builder->GetAddressOf(ir_lhs));
-            return ir_builder->Call(ir_member_function, ir_arguments);
+            ir_user_arguments.insert(ir_user_arguments.begin(), ir_builder->GetAddressOf(ir_lhs));
+            return ir_builder->Call(ir_member_function, ir_user_arguments);
         }
 
         if (auto ir_access_property = Cast<ir::AccessProperty>(ir_lhs)) {
             // getter函数必须存在
             auto ir_getter_function_type =
                 ir_access_property->property->get_function->function_type;
-            if (ir_arguments.size() != ir_getter_function_type->parameter_types.size() - 1) {
+            if (ir_user_arguments.size() != ir_getter_function_type->parameter_types.size() - 1) {
                 logger->Error(
                     fmt::format("the property arguments size is not matched, require {} argument, "
                                 "but give {}",
                                 ir_getter_function_type->parameter_types.size() - 1,
-                                ir_arguments.size()),
+                                ir_user_arguments.size()),
                     ast_expressions);
             }
 
             for (auto [ir_argument, ir_parameter_type, ast_expression] :
-                 boost::combine(ir_arguments,
+                 boost::combine(ir_user_arguments,
                                 boost::make_iterator_range(
                                     std::next(ir_getter_function_type->parameter_types.begin()),
                                     ir_getter_function_type->parameter_types.end()),
@@ -338,7 +469,7 @@ class ExpressionLoweringVisitor {
             // 移除, 在末尾插入, 应为参数应该在属性访问的前面
             ir_access_property->GetParentBlock()->remove(ir_access_property);
             ir_builder->CurrentBlock()->push_back(ir_access_property);
-            ir_access_property->Arguments(ir_arguments);
+            ir_access_property->Arguments(ir_user_arguments);
             return ir_access_property;
         }
 
@@ -713,11 +844,67 @@ class ExpressionLoweringVisitor {
         return boost::apply_visitor(*this, ast_operand);
     }
 
+    // prajna/lowering/expression_lowering_visitor.hpp
+
     std::shared_ptr<ir::Value> ConvertBinaryOperationToCallFunction(
         std::shared_ptr<ir::Value> ir_lhs, ast::BinaryOperation ast_binary_operation) {
-        // 会把binary operator转换为成员函数的调用
+        // 先把 LHS 规格化为 VariableLiked
         auto ir_variable_liked = ir_builder->VariableLikedNormalize(ir_lhs);
         auto binary_operator_name = ast_binary_operation.operator_.string_token;
+
+        // ===== 新增：对 Array<T,N> 的二元运算走“循环 + 指针/索引”路径，避免按值参数 =====
+        if (auto ir_array_type = Cast<ir::ArrayType>(ir_variable_liked->type)) {
+            // 仅在元素类型是标量整型或浮点型的时候启用该优化，复杂类型保持原语义（走函数）
+            bool is_scalar_ok = Is<ir::IntType>(ir_array_type->value_type) ||
+                                Is<ir::FloatType>(ir_array_type->value_type);
+            bool is_supported_op = (binary_operator_name == "+" || binary_operator_name == "-" ||
+                                    binary_operator_name == "*" || binary_operator_name == "/");
+            if (is_scalar_ok && is_supported_op) {
+                // 取 RHS，且必须同型数组
+                auto ir_rhs_value = this->applyOperand(ast_binary_operation.operand);
+                if (ir_rhs_value->type != ir_variable_liked->type) {
+                    logger->Error("the RHS type is not matched for array binary operator",
+                                  ast_binary_operation.operand);
+                }
+
+                // 规格化 RHS 为 VariableLiked，便于下标访问
+                auto ir_rhs_variable_liked = ir_builder->VariableLikedNormalize(ir_rhs_value);
+
+                // 结果数组（局部变量）
+                auto ir_result_array = ir_builder->Create<ir::LocalVariable>(ir_array_type);
+
+                // for i in [0, N):
+                auto ir_index_variable = ir_builder->Create<ir::LocalVariable>(ir::i64);
+                auto ir_first_index = ir_builder->GetConstant<int64_t>(0);
+                auto ir_last_index = ir_builder->GetConstant<int64_t>(ir_array_type->size);
+                auto ir_loop_block = ir::Block::Create();
+                auto ir_for = ir_builder->Create<ir::For>(ir_index_variable, ir_first_index,
+                                                          ir_last_index, ir_loop_block);
+
+                {
+                    auto scope = ir_builder->PushBlockRAII(ir_for->LoopBlock());
+                    // 取 LHS[i], RHS[i], 做标量二元运算，写回 result[i]
+                    auto ir_lhs_elem =
+                        ir_builder->Create<ir::IndexArray>(ir_variable_liked, ir_index_variable);
+                    auto ir_rhs_elem = ir_builder->Create<ir::IndexArray>(ir_rhs_variable_liked,
+                                                                          ir_index_variable);
+
+                    // 标量运算（依然复用现有的 CallBinaryOperator，类型就是元素类型）
+                    auto ir_scalar_result = ir_builder->CallBinaryOperator(
+                        ir_lhs_elem, binary_operator_name, ir_rhs_elem);
+
+                    auto ir_result_elem =
+                        ir_builder->Create<ir::IndexArray>(ir_result_array, ir_index_variable);
+                    ir_builder->Create<ir::WriteVariableLiked>(ir_scalar_result, ir_result_elem);
+                }
+
+                // 返回结果数组
+                return ir_result_array;
+            }
+        }
+        // ===== 新增分支结束，未命中时继续原有逻辑 =====
+
+        // 原实现：把其余的运算都转换为“成员函数调用”
         auto ir_function =
             ir_builder->GetBinaryOperator(ir_variable_liked->type, binary_operator_name);
         if (!ir_function) {
@@ -737,6 +924,32 @@ class ExpressionLoweringVisitor {
         }
         return ir_builder->Call(ir_function, ir_arguemnts);
     }
+
+    // std::shared_ptr<ir::Value> ConvertBinaryOperationToCallFunction(
+    //     std::shared_ptr<ir::Value> ir_lhs, ast::BinaryOperation ast_binary_operation) {
+    //     // 会把binary operator转换为成员函数的调用
+    //     auto ir_variable_liked = ir_builder->VariableLikedNormalize(ir_lhs);
+    //     auto binary_operator_name = ast_binary_operation.operator_.string_token;
+    //     auto ir_function =
+    //         ir_builder->GetBinaryOperator(ir_variable_liked->type, binary_operator_name);
+    //     if (!ir_function) {
+    //         logger->Error(
+    //             fmt::format("{} operator not found",
+    //             ast_binary_operation.operator_.string_token), ast_binary_operation.operator_);
+    //     }
+    //     auto ir_this_pointer =
+    //     ir_builder->Create<ir::GetAddressOfVariableLiked>(ir_variable_liked);
+    //     std::list<std::shared_ptr<ir::Value>> ir_arguemnts(2);
+    //     ir_arguemnts.front() = ir_this_pointer;
+    //     ir_arguemnts.back() = this->applyOperand(ast_binary_operation.operand);
+    //     if (ir_arguemnts.back()->type != ir_function->function_type->parameter_types.back()) {
+    //         logger->Error(fmt::format("the types {}, {} are not matched",
+    //                                   ir_function->function_type->parameter_types.back()->fullname,
+    //                                   ir_arguemnts.back()->type->fullname),
+    //                       ast_binary_operation.operand);
+    //     }
+    //     return ir_builder->Call(ir_function, ir_arguemnts);
+    // }
 
     std::shared_ptr<ir::Value> operator()(ast::Closure ast_closure);
 

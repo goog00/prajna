@@ -429,10 +429,37 @@ class StatementLoweringVisitor : public std::enable_shared_from_this<StatementLo
                                      ir::PointerType::Create(ir_builder->current_implement_type));
         }
 
+        // 数组 ABI 降低（按值形参 -> 指针；按值返回 -> sret）===
+        auto IsArrayType = [](std::shared_ptr<ir::Type> type) -> bool {
+            return Cast<ir::ArrayType>(type) != nullptr;
+        };
+
+        // 形参：遇到 Array<T,N> 就改成 Pointer(Array<T,N>)
+        for (auto& parameter_type : ir_argument_types) {
+            if (IsArrayType(parameter_type)) {
+                parameter_type = ir::PointerType::Create(parameter_type);
+            }
+        }
+
+        // 返回：遇到 Array<T,N> 返回值 => 改成 sret：void 返回 + 在参数表最前面插入
+        // Pointer(Array<T,N>)
+        bool use_sret = false;
+        std::shared_ptr<ir::Type> sret_pointee_type = nullptr;
+
+        if (IsArrayType(return_type)) {
+            use_sret = true;
+            sret_pointee_type = return_type;
+            ir_argument_types.push_front(ir::PointerType::Create(return_type));  // 放最前面
+            return_type = ir::VoidType::Create();
+        }
+
         auto ir_function_type = ir::FunctionType::Create(ir_argument_types, return_type);
 
         auto ir_function = ir_builder->CreateFunction(ast_function_header.name, ir_function_type);
-        ir_function->annotation_dict = this->ApplyAnnotations(ast_function_header.annotation_dict);
+        if (use_sret) {
+            ir_function->annotation_dict["lowered_sret"] = {"true"};
+            ir_function->annotation_dict["sret_ret_fullname"] = {sret_pointee_type->fullname};
+        }
 
         // 加入interface里
         if (ir_builder->current_implement_interface) {

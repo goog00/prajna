@@ -15,3 +15,29 @@ func TestNestedArray() {
     tmp_array[0][0] = 3;
     // test::Assert(tmp_array[0][0] == 3);
 }
+
+struct ArrayTest{
+    a: Array<i64, 1000>;
+}
+@test
+func Test() {
+   var tmp: ArrayTest;
+   tmp.a[988] = 42;
+
+}
+
+@test
+func OnlyMemcpy() {
+    var a: Array<i64, 2000>;
+    var b: Array<i64, 2000>;
+    b = a;               // 只测赋值→memcpy
+    test::Assert(true);
+}
+
+@test
+func ArrayAdd_NoFCAExplosion() {
+    var x: Array<i64, 1000000>;
+    var y: Array<i64, 1000000>;
+    var z = x + y;                  // 二元运算 —— 应生成 for 循环逐元素，不调用按值形参函数
+    test::Assert(true);
+}

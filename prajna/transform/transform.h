@@ -711,6 +711,86 @@ inline bool InsertLocationForAssert(std::shared_ptr<ir::Module> ir_module) {
     return false;
 }
 
+inline bool TransformWriteStructWrappedArrayAssignToMemcpy(std::shared_ptr<ir::Module> ir_module) {
+    bool changed = false;
+
+    // 遍历所有 WriteVariableLiked 指令
+    auto write_list = utility::GetAll<ir::WriteVariableLiked>(ir_module);
+    for (auto ir_write : write_list) {
+        auto lhs_value = ir_write->variable();
+        auto rhs_value = ir_write->Value();
+
+        auto lhs_type = lhs_value->type;
+        auto rhs_type = rhs_value->type;
+
+        // 仅处理左右同类型的 StructType
+        auto lhs_struct_type = Cast<ir::StructType>(lhs_type);
+        auto rhs_struct_type = Cast<ir::StructType>(rhs_type);
+        if (!lhs_struct_type || !rhs_struct_type) {
+            continue;
+        }
+        if (lhs_struct_type != rhs_struct_type) {
+            continue;
+        }
+
+        // 仅处理 “单字段，并且这个字段是 ArrayType” 的结构体
+        if (lhs_struct_type->fields.size() != 1) {
+            continue;
+        }
+        auto only_field = lhs_struct_type->fields.front();
+        auto field_array_type = Cast<ir::ArrayType>(only_field->type);
+        if (!field_array_type) {
+            continue;
+        }
+
+        // —— 准备在 ir_write 之前插入 memcpy 调用
+        auto ir_builder = lowering::IrBuilder::Create(ir_module->symbol_table, ir_module, nullptr);
+        auto scope = ir_builder->PushBlockRAII(ir_write->GetParentBlock());
+        ir_builder->inserter_iterator = std::ranges::find(*ir_write->GetParentBlock(), ir_write);
+
+        // 规范化 LHS/RHS，再访问唯一字段
+        auto lhs_var_norm = ir_builder->VariableLikedNormalize(lhs_value);
+        auto rhs_var_norm = ir_builder->VariableLikedNormalize(rhs_value);
+
+        auto lhs_field_var = ir_builder->Create<ir::AccessField>(lhs_var_norm, only_field);
+        auto rhs_field_var = ir_builder->Create<ir::AccessField>(rhs_var_norm, only_field);
+
+        // 取字段地址
+        auto lhs_addr = ir_builder->Create<ir::GetAddressOfVariableLiked>(lhs_field_var);
+        auto rhs_addr = ir_builder->Create<ir::GetAddressOfVariableLiked>(rhs_field_var);
+
+  
+
+        // （保留你前面的 lhs_addr / rhs_addr / total_bytes 计算）
+        auto i8ptr_type = ir::PointerType::Create(ir::i8);
+        auto lhs_ptr_i8 = ir_builder->Create<ir::BitCast>(lhs_addr, i8ptr_type);
+        auto rhs_ptr_i8 = ir_builder->Create<ir::BitCast>(rhs_addr, i8ptr_type);
+
+        auto ir_size = ir_builder->GetConstant<int64_t>(field_array_type->size *
+                                                        field_array_type->value_type->bytes);
+
+      
+    
+        auto memcpy_ty = ir::FunctionType::Create({i8ptr_type, i8ptr_type, ir_size->type},
+                                                  ir::VoidType::Create());
+        auto memcpy_stub = ir::Function::Create(memcpy_ty);
+        memcpy_stub->fullname = "::__lowering_builtin_memcpy";
+        memcpy_stub->name = memcpy_stub->fullname;
+       
+        ir_builder->Call(memcpy_stub, {lhs_ptr_i8, rhs_ptr_i8, ir_size});
+
+        // 删除原 write 指令
+        utility::RemoveFromParent(ir_write);
+        ir_write->Finalize();
+
+        changed = true;
+    }
+
+    return changed;
+}
+
+
+
 inline void ApplySSATransformations(std::shared_ptr<ir::Module> ir_module) {
     bool changed = true;
     while (changed) {
@@ -734,6 +814,7 @@ inline std::shared_ptr<ir::Module> Transform(std::shared_ptr<ir::Module> ir_modu
     InsertLocationForAssert(ir_module);
     ConvertForMultiDimToFor1Dim(ir_module);
     ConvertPropertyToFunctionCall(ir_module);
+
     InsertReferenceCount(ir_module);
     TopologicalSortFunction(ir_module);
     InlineFunction(ir_module);
@@ -743,6 +824,7 @@ inline std::shared_ptr<ir::Module> Transform(std::shared_ptr<ir::Module> ir_modu
     ConvertKernelFunctionCallToKernelLaunch(ir_module);
     PartitionGpuKernelsAndMarkTargets(ir_module);
     ConvertGlobalVariableToGlobalAlloca(ir_module);
+    TransformWriteStructWrappedArrayAssignToMemcpy(ir_module);
     ApplySSATransformations(ir_module);
     // 只申明host module的外部函数, gPU module目前不引用外部函数
     DeclareExternalFunction(ir_module);
